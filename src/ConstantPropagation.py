@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import List, Tuple, Sequence, Optional
 
 from qiskit import QuantumCircuit
@@ -14,6 +15,7 @@ import numpy as np
 from util.UnionTable import UnionTable
 from util.ActivationState import ActivationState
 from util.BitState import BitState
+from util.QubitState import QubitStateOrTop, EPS
 from SimplifyCondition import SimplifyCondition
 import random
 
@@ -54,22 +56,252 @@ RESET_NAME = "reset"
 MEASURE_NAME = "measure"
 IF_ELSE_NAME = "if_else"
 
+@dataclass
+class _Branch:
+    table: UnionTable
+    clbit_states: dict[Clbit, BitState]
+
 # ConstantPropagation main class
 class ConstantPropagation:
     """Run the *constant-propagation* analysis/optimisation on a circuit."""
 
     MAX_AMPLITUDES: int = 32
+    MAX_BRANCHES: int = 1
+
+    @staticmethod
+    def _clone_branch(branch: _Branch) -> _Branch:
+        return _Branch(branch.table.clone(), dict(branch.clbit_states))
+
+    @staticmethod
+    def _merge_clbit_states(branches: Sequence[_Branch]) -> dict[Clbit, BitState]:
+        if not branches:
+            return {}
+        all_clbits = set()
+        for br in branches:
+            all_clbits.update(br.clbit_states.keys())
+        merged: dict[Clbit, BitState] = {}
+        for c in all_clbits:
+            states = {br.clbit_states.get(c, BitState.ZERO) for br in branches}
+            merged[c] = next(iter(states)) if len(states) == 1 else BitState.NOT_KNOWN
+        return merged
+
+    @staticmethod
+    def _table_signature(table: UnionTable, qubit: int) -> Optional[Tuple[Tuple[int, ...], object]]:
+        reg = table[qubit]
+        if reg.is_top():
+            return None
+        qs = reg.get_qubit_state()
+        group = tuple(table.qubits_in_state(qs))
+        return (group, qs)
+
+    @classmethod
+    def _merge_tables(cls, tables: Sequence[UnionTable]) -> UnionTable:
+        if not tables:
+            raise ValueError("No tables to merge")
+        n_qubits = tables[0].size()
+        merged = UnionTable(n_qubits)
+        merged.qu_reg = [QubitStateOrTop() for _ in range(n_qubits)]
+        visited: set[int] = set()
+        base = tables[0]
+        for i in range(n_qubits):
+            if i in visited:
+                continue
+            sig = cls._table_signature(base, i)
+            if sig is None:
+                visited.add(i)
+                continue
+            group, qs = sig
+            visited.update(group)
+            if all(cls._table_signature(t, i) == sig for t in tables[1:]):
+                qs_clone = qs.clone()
+                for q in group:
+                    merged.qu_reg[q] = QubitStateOrTop(qs_clone)
+        return merged
+
+    @classmethod
+    def _merge_branches(cls, branches: Sequence[_Branch]) -> _Branch:
+        merged_table = cls._merge_tables([br.table for br in branches])
+        merged_clbits = cls._merge_clbit_states(branches)
+        return _Branch(merged_table, merged_clbits)
+
+    @staticmethod
+    def _eval_tuple_condition(instr_cond, cargs, clbit_states) -> Optional[bool]:
+        _, val_exp = instr_cond
+        mask = 0
+        expected = 0
+        all_known = True
+        for c in cargs:
+            st = clbit_states.get(c, BitState.ZERO)
+            if st == BitState.NOT_KNOWN:
+                all_known = False
+                continue
+            mask |= (1 << c._index)
+            if st == BitState.ONE:
+                expected |= (1 << c._index)
+        if all_known:
+            return expected == val_exp
+        if (val_exp & mask) != expected:
+            return False
+        return None
+
+    @classmethod
+    def _eval_condition(cls, instr_cond, cargs, clbit_states) -> Optional[bool]:
+        if isinstance(instr_cond, tuple):
+            return cls._eval_tuple_condition(instr_cond, cargs, clbit_states)
+        res = SimplifyCondition.simplify(instr_cond, clbit_states)
+        if res.always_true:
+            return True
+        if res.always_false:
+            return False
+        return None
+
+    @classmethod
+    def _simplify_condition_for_output(cls, instr_cond, cargs, clbit_states) -> Tuple[Optional[bool], Optional[object]]:
+        if isinstance(instr_cond, tuple):
+            _, val_exp = instr_cond
+            mask = 0
+            expected = 0
+            not_determined_bits = []
+            all_known = True
+            for c in cargs:
+                st = clbit_states.get(c, BitState.ZERO)
+                if st in (BitState.ZERO, BitState.ONE):
+                    mask |= (1 << c._index)
+                    if st == BitState.ONE:
+                        expected |= (1 << c._index)
+                else:
+                    all_known = False
+                    not_determined_bits.append(c)
+            if all_known:
+                return (expected == val_exp), None
+            if (val_exp & mask) != expected:
+                return False, None
+            if len(not_determined_bits) == 1:
+                c = not_determined_bits[0]
+                bit_val = 0 if (1 << c._index) & val_exp == 0 else 1
+                return None, (c, bit_val)
+            bits = []
+            for c in not_determined_bits:
+                bit_val = 0 if (1 << c._index) & val_exp == 0 else 1
+                bit = c if bit_val == 1 else expr.bit_not(c)
+                bits.append(bit)
+            cond = reduce(expr.bit_and, bits)
+            return None, cond
+
+        res = SimplifyCondition.simplify(instr_cond, clbit_states)
+        if res.always_true:
+            return True, None
+        if res.always_false:
+            return False, None
+        return None, res.expr
+
+    @classmethod
+    def _apply_ops_to_table(
+        cls,
+        table: UnionTable,
+        ops: Sequence[Tuple[Instruction, Sequence[Qubit], Sequence[Clbit]]],
+        max_amplitudes: int,
+    ) -> None:
+        for instr, qargs, _ in ops:
+            name_lc = instr.name.lower()
+            if name_lc in IGNORED_GATES:
+                continue
+            if name_lc in UNSUPPORTED_GATES or name_lc in (MEASURE_NAME, RESET_NAME, IF_ELSE_NAME):
+                for q in qargs:
+                    table.set_top(q._index)
+                continue
+            cls._apply_gate(table, instr, qargs, max_amplitudes)
+
+    @classmethod
+    def _handle_measurement(
+        cls,
+        branches: Sequence[_Branch],
+        inst: Instruction,
+        max_branches: int,
+    ) -> Tuple[List[_Branch], bool]:
+        q_ind = inst.qubits[0]._index
+        c_ind = inst.clbits[0]
+        new_branches: List[_Branch] = []
+        keep_instr = False
+
+        for br in branches:
+            table = br.table
+            clbits = br.clbit_states
+            reg = table[q_ind]
+
+            prob0 = prob1 = None
+            if reg.is_qubit_state():
+                qs = reg.get_qubit_state()
+                idx = table.index_in_state(q_ind)
+                prob0 = qs.probability_measure_zero(idx)
+                prob1 = qs.probability_measure_one(idx)
+
+            outcome = None
+            if prob0 is not None and prob0 >= 1 - EPS:
+                outcome = 0
+            elif prob1 is not None and prob1 >= 1 - EPS:
+                outcome = 1
+
+            if outcome is not None:
+                desired = BitState.ZERO if outcome == 0 else BitState.ONE
+                if clbits.get(c_ind, BitState.ZERO) != desired:
+                    keep_instr = True
+                new_br = cls._clone_branch(br)
+                new_br.table.collapse_measurement(q_ind, outcome)
+                new_br.clbit_states[c_ind] = desired
+                new_branches.append(new_br)
+                continue
+
+            keep_instr = True
+            if len(new_branches) + 2 <= max_branches:
+                for outcome in (0, 1):
+                    new_br = cls._clone_branch(br)
+                    if not new_br.table.collapse_measurement(q_ind, outcome):
+                        continue
+                    new_br.clbit_states[c_ind] = BitState.ZERO if outcome == 0 else BitState.ONE
+                    new_branches.append(new_br)
+            else:
+                new_br = cls._clone_branch(br)
+                new_br.table.set_top(q_ind)
+                new_br.clbit_states[c_ind] = BitState.NOT_KNOWN
+                new_branches.append(new_br)
+
+        return new_branches, keep_instr
+
+    @classmethod
+    def _handle_reset(cls, branches: Sequence[_Branch], qubit_index: int) -> bool:
+        keep_instr = False
+        for br in branches:
+            table = br.table
+            reg = table[qubit_index]
+            prob0 = None
+            if reg.is_qubit_state():
+                idx = table.index_in_state(qubit_index)
+                prob0 = reg.get_qubit_state().probability_measure_zero(idx)
+            if prob0 is None or prob0 < 1 - EPS:
+                keep_instr = True
+                break
+
+        if keep_instr:
+            for br in branches:
+                br.table.reset_state(qubit_index)
+        return keep_instr
     
     @classmethod
-    def _propagate(cls, circuit: QuantumCircuit, max_amplitudes: int | None = None, max_ent_group_size = 1, table: UnionTable | None = None) -> Tuple[UnionTable, QuantumCircuit]:
+    def _propagate(
+        cls,
+        circuit: QuantumCircuit,
+        max_amplitudes: int | None = None,
+        table: UnionTable | None = None,
+        max_branches: int | None = None,
+    ) -> Tuple[UnionTable, QuantumCircuit]:
         max_amplitudes = max_amplitudes or cls.MAX_AMPLITUDES
+        max_branches = cls.MAX_BRANCHES if max_branches is None else max(1, max_branches)
 
         # Initialize UnionTable and classical bit states
         table = table or UnionTable(circuit.num_qubits)
-        clbit_states: dict[Clbit, BitState] = {}
-        # Initialize all classical bits to ZERO
-        for c in circuit.clbits:
-            clbit_states[c] = BitState.ZERO
+        clbit_states: dict[Clbit, BitState] = {c: BitState.ZERO for c in circuit.clbits}
+        branches: List[_Branch] = [_Branch(table, clbit_states)]
 
         # Prepare new circuit
         new_circ = QuantumCircuit(*circuit.qregs, *circuit.cregs)
@@ -83,9 +315,10 @@ class ConstantPropagation:
             q_indices = [q._index for q in qargs]
             name_lc = instr.name.lower()
 
-            cls._check_amplitudes(table, max_amplitudes)
+            for br in branches:
+                cls._check_amplitudes(br.table, max_amplitudes)
 
-            if table.all_top() and name_lc != RESET_NAME:
+            if all(br.table.all_top() for br in branches) and name_lc != RESET_NAME:
                 new_circ.append(instr, qargs, cargs)
                 continue
 
@@ -96,74 +329,54 @@ class ConstantPropagation:
 
             # Unsupported or classically-controlled operations
             if name_lc in UNSUPPORTED_GATES:
-                for t in q_indices:
-                    table.set_top(t)
+                for br in branches:
+                    for t in q_indices:
+                        br.table.set_top(t)
                 new_circ.append(instr, qargs, cargs)
                 continue
 
             if name_lc == IF_ELSE_NAME:
-                cls._optimize_classic_controlled_operation(new_circ, clbit_states, inst, table, max_amplitudes)
+                branches = cls._optimize_classic_controlled_operation(
+                    new_circ,
+                    branches,
+                    inst,
+                    max_amplitudes,
+                    max_branches,
+                )
                 continue
                 
             if name_lc == MEASURE_NAME: # Single measurement
-                q_ind = q_indices[0]
-                c_ind = cargs[0]
-                
-                # If the qubit is known to be |0> and the bit is known to be 0, skip the measurement
-                if table.purity_test(q_ind) and table[q_ind].is_qubit_state():
-                    _prob_meas_0 = table[q_ind].get_qubit_state().probability_measure_zero(table.index_in_state(q_ind))
-                    _prob_meas_1 = table[q_ind].get_qubit_state().probability_measure_one(table.index_in_state(q_ind))
-                    # The measurement produces no effect on both qubit and classical bit, skip it
-                    if _prob_meas_0 == 1.0:
-                        if clbit_states.get(c_ind) == BitState.ZERO:
-                            pass
-                        else:
-                            # The measurement produces no effect on the qubit, but the classical bit state changes
-                            new_circ.append(instr, qargs, cargs)
-                            clbit_states[cargs[0]] = BitState.ZERO
-                    elif _prob_meas_1 == 1.0:
-                        if clbit_states.get(c_ind) == BitState.ONE:
-                            pass
-                        else:
-                            # The measurement produces no effect on the qubit, but the classical bit state changes
-                            new_circ.append(instr, qargs, cargs)
-                            clbit_states[cargs[0]] = BitState.ONE
-                    else: # The measurement produces an effect, so we need to keep it
-                        new_circ.append(instr, qargs, cargs)
-                        table.set_top(q_ind)
-                        clbit_states[cargs[0]] = BitState.NOT_KNOWN
-                else:
+                branches, keep_instr = cls._handle_measurement(branches, inst, max_branches)
+                if keep_instr:
                     new_circ.append(instr, qargs, cargs)
-                    table.set_top(q_ind)
-                    clbit_states[cargs[0]] = BitState.NOT_KNOWN
                 continue
 
             if name_lc == RESET_NAME:
-                ind = q_indices[0]
-                if table.purity_test(ind) and table[ind].is_qubit_state():
-                    _prob_meas_0 = table[ind].get_qubit_state().probability_measure_zero(table.index_in_state(ind))
-                    if _prob_meas_0 != 1.0:
-                        new_circ.append(instr, qargs, cargs)
-                    # else: Qubit is already in the state |0>, so skip the reset
-                else:
+                if cls._handle_reset(branches, q_indices[0]):
                     new_circ.append(instr, qargs, cargs)
-
-                table.reset_state(ind)
                 continue
 
             
-            min_contr = cls._minimize_controls(table, instr, qargs)
+            merged_table = cls._merge_tables([br.table for br in branches])
+            min_contr = cls._minimize_controls(merged_table, instr, qargs)
             if min_contr is not None:
                 instr_min_contr, qargs_min_contr = min_contr
-                cls._apply_gate(table, instr_min_contr, qargs_min_contr, max_amplitudes)
+                for br in branches:
+                    cls._apply_gate(br.table, instr_min_contr, qargs_min_contr, max_amplitudes)
                 new_circ.append(instr_min_contr, qargs_min_contr, cargs)
 
-        return table, new_circ
+        merged = cls._merge_branches(branches)
+        return merged.table, new_circ
 
     @classmethod
-    def optimize(cls, circuit: QuantumCircuit, max_amplitudes: int | None = None, max_ent_group_size = 1) -> QuantumCircuit:
+    def optimize(
+        cls,
+        circuit: QuantumCircuit,
+        max_amplitudes: int | None = None,
+        max_branches: int | None = None,
+    ) -> QuantumCircuit:
         """Perform constant-propagation in-place on *circuit."""
-        _, new_circ = cls._propagate(circuit, max_amplitudes, max_ent_group_size)
+        _, new_circ = cls._propagate(circuit, max_amplitudes, max_branches=max_branches)
 
         return new_circ
     
@@ -187,131 +400,80 @@ class ConstantPropagation:
         return qc_branch
     
     @classmethod
-    def _optimize_classic_controlled_operation(cls, new_circ: QuantumCircuit, clbit_states: dict[Clbit, BitState], inst: Instruction, table: UnionTable | None = None, max_amplitudes = 1) -> None:
+    def _optimize_classic_controlled_operation(
+        cls,
+        new_circ: QuantumCircuit,
+        branches: Sequence[_Branch],
+        inst: Instruction,
+        max_amplitudes = 1,
+        max_branches = 1,
+    ) -> List[_Branch]:
         instr = inst.operation
         cargs = inst.clbits
         instr_cond = instr.condition
-        
-        qc_then = cls._construct_branch_circuit(table, inst.params[0])
 
-        qc_else = []
-        if len(inst.params) > 1:
-            qc_else = cls._construct_branch_circuit(table, inst.params[1])
-            
-        
-        if len(qc_then) == 0 and len(qc_else) == 0:
-            return # No operation in both branches
+        if not branches:
+            return []
 
-        if isinstance(instr_cond, tuple): # Case where the condition is a comparison between a register and an integer
-            if all(clbit_states.get(c, BitState.ZERO) in (BitState.ZERO, BitState.ONE) for c in cargs):
-                # Compare bit states in 'clbit_states' with the value in the expression
-                _, val_exp = instr_cond
-                val_state = sum((1 if clbit_states.get(c, BitState.ZERO) == BitState.ONE else 0) << c._index for c in cargs)
-
-                if val_exp == val_state: # We know that the gate will always be applied
-                    # Add the instruction without the classical control
-                    for qc_then_instr, qc_then_qargs, qc_then_cargs in qc_then:
-                        if table is not None: 
-                            cls._apply_gate(table, qc_then_instr, qc_then_qargs, max_amplitudes)
-                        new_circ.append(qc_then_instr, qc_then_qargs, qc_then_cargs)
-                else:
-                    if len(qc_else) > 0:
-                        # Add the instruction without the classical control
-                        for qc_else_instr, qc_else_qargs, qc_else_cargs in qc_else:
-                            if table is not None:
-                                cls._apply_gate(table, qc_else_instr, qc_else_qargs, max_amplitudes)
-                            new_circ.append(qc_else_instr, qc_else_qargs, qc_else_cargs)
-                    # else: pass # The operation will not be applied at runtime
+        cond_evals: List[Optional[bool]] = []
+        branches_then: List[_Branch] = []
+        branches_else: List[_Branch] = []
+        for br in branches:
+            cond_eval = cls._eval_condition(instr_cond, cargs, br.clbit_states)
+            cond_evals.append(cond_eval)
+            if cond_eval is True:
+                branches_then.append(br)
+            elif cond_eval is False:
+                branches_else.append(br)
             else:
-                # Check if the already determined bit satisfies the condition
-                mask = 0
-                expected = 0
-                not_determined_bits = []
-                for c in cargs:
-                    i = c._index
-                    st = clbit_states.get(c, BitState.ZERO)
-                    if st in (BitState.ZERO, BitState.ONE):
-                        mask |= (1 << i)
-                        if st == BitState.ONE:
-                            expected |= (1 << i)
-                    else:
-                        not_determined_bits.append(c)
-                _, val_exp = instr_cond
-                if (val_exp & mask) == expected: # Append the classical controlled operation
-                    if len(not_determined_bits) == 1: # Only one bit as control register
-                        c = not_determined_bits[0]
-                        with new_circ.if_test((c, 0 if (1 << c._index) & val_exp == 0 else 1)) as else_:
-                            for qc_then_instr, qc_then_qargs, qc_then_cargs in qc_then:
-                                new_circ.append(qc_then_instr, qc_then_qargs, qc_then_cargs)
-                        if len(qc_else) > 0:
-                            with else_:
-                                for qc_else_instr, qc_else_qargs, qc_else_cargs in qc_else:
-                                    new_circ.append(qc_else_instr, qc_else_qargs, qc_else_cargs)
-                    else: # Multiple bits as control register
-                        # Builds the new condition for the classical controlled operation
-                        bits = []
-                        for c in not_determined_bits:
-                            bit = c
-                            bit_val_exp = 0 if (1 << bit._index) & val_exp == 0 else 1
-                            if bit_val_exp == 0:
-                                bit = expr.bit_not(bit)
-                            bits.append(bit)
-                        cond = reduce(expr.bit_and, bits)
-                        with new_circ.if_test(cond) as else_:
-                            for qc_then_instr, qc_then_qargs, qc_then_cargs in qc_then:
-                                new_circ.append(qc_then_instr, qc_then_qargs, qc_then_cargs)
-                        if len(qc_else) > 0:
-                            with else_:
-                                for qc_else_instr, qc_else_qargs, qc_else_cargs in qc_else:
-                                    new_circ.append(qc_else_instr, qc_else_qargs, qc_else_cargs)
-                    # Set to top all qubits involved in the then-branch and else-branch
-                    for qc_then_instr, qc_then_qargs, qc_then_cargs in qc_then:   
-                        q_ind = [q._index for q in qc_then_qargs]
-                        for ind in q_ind:
-                            table.set_top(ind)
-                    for qc_else_instr, qc_else_qargs, qc_else_cargs in qc_else:
-                        q_ind = [q._index for q in qc_else_qargs]
-                        for ind in q_ind:
-                            table.set_top(ind)
-                else:
-                    if len(qc_else) > 0:
-                        # Add the instruction without the classical control
-                        for qc_else_instr, qc_else_qargs, qc_else_cargs in qc_else:
-                            cls._apply_gate(table, qc_else_instr, qc_else_qargs, max_amplitudes)
-                            new_circ.append(qc_else_instr, qc_else_qargs, qc_else_cargs)
-                    # else: pass # The operation will not be applied at runtime
-        else: # Case where the condition is an expression
-            cond = instr_cond
-            res = SimplifyCondition.simplify(cond, clbit_states)
-            if res.always_true: # The inner operation will always be applied
-                for qc_then_instr, qc_then_qargs, qc_then_cargs in qc_then:
-                    # Add the instruction without the classical control
-                    cls._apply_gate(table, qc_then_instr, qc_then_qargs, max_amplitudes)
-                    new_circ.append(qc_then_instr, qc_then_qargs, qc_then_cargs)
-            elif res.always_false:
-                if len(qc_else) > 0:
-                    # Add the instruction without the classical control
-                    for qc_else_instr, qc_else_qargs, qc_else_cargs in qc_else:
-                        cls._apply_gate(table, qc_else_instr, qc_else_qargs, max_amplitudes)
-                        new_circ.append(qc_else_instr, qc_else_qargs, qc_else_cargs)
-                # else: pass # The operation will not be applied at runtime
-            else: # The inner operation may be applied
-                with new_circ.if_test(res.expr) as else_:
+                branches_then.append(br)
+                branches_else.append(br)
+
+        table_then = cls._merge_tables([br.table for br in branches_then]) if branches_then else None
+        table_else = cls._merge_tables([br.table for br in branches_else]) if branches_else else None
+
+        qc_then = cls._construct_branch_circuit(table_then, inst.params[0] if len(inst.params) > 0 else None)
+        qc_else = cls._construct_branch_circuit(table_else, inst.params[1] if len(inst.params) > 1 else None)
+
+        merged_clbits = cls._merge_clbit_states(branches)
+        cond_status, cond_expr = cls._simplify_condition_for_output(instr_cond, cargs, merged_clbits)
+
+        if cond_status is True:
+            for qc_then_instr, qc_then_qargs, qc_then_cargs in qc_then:
+                new_circ.append(qc_then_instr, qc_then_qargs, qc_then_cargs)
+        elif cond_status is False:
+            for qc_else_instr, qc_else_qargs, qc_else_cargs in qc_else:
+                new_circ.append(qc_else_instr, qc_else_qargs, qc_else_cargs)
+        else:
+            if len(qc_then) > 0 or len(qc_else) > 0:
+                cond = cond_expr if cond_expr is not None else instr_cond
+                with new_circ.if_test(cond) as else_:
                     for qc_then_instr, qc_then_qargs, qc_then_cargs in qc_then:
                         new_circ.append(qc_then_instr, qc_then_qargs, qc_then_cargs)
                 if len(qc_else) > 0:
                     with else_:
                         for qc_else_instr, qc_else_qargs, qc_else_cargs in qc_else:
                             new_circ.append(qc_else_instr, qc_else_qargs, qc_else_cargs)
-                # Set to top all qubits involved in the then-branch and else-branch
-                for qc_then_instr, qc_then_qargs, qc_then_cargs in qc_then:   
-                    q_ind = [q._index for q in qc_then_qargs]
-                    for ind in q_ind:
-                        table.set_top(ind)
-                for qc_else_instr, qc_else_qargs, qc_else_cargs in qc_else:
-                    q_ind = [q._index for q in qc_else_qargs]
-                    for ind in q_ind:
-                        table.set_top(ind)
+
+        next_branches: List[_Branch] = []
+        for br, cond_eval in zip(branches, cond_evals):
+            if cond_eval is True:
+                new_br = cls._clone_branch(br)
+                cls._apply_ops_to_table(new_br.table, qc_then, max_amplitudes)
+                next_branches.append(new_br)
+            elif cond_eval is False:
+                new_br = cls._clone_branch(br)
+                cls._apply_ops_to_table(new_br.table, qc_else, max_amplitudes)
+                next_branches.append(new_br)
+            else:
+                new_br_then = cls._clone_branch(br)
+                cls._apply_ops_to_table(new_br_then.table, qc_then, max_amplitudes)
+                next_branches.append(new_br_then)
+                new_br_else = cls._clone_branch(br)
+                cls._apply_ops_to_table(new_br_else.table, qc_else, max_amplitudes)
+                next_branches.append(new_br_else)
+
+        return [cls._merge_branches(next_branches)]
     @classmethod
     def _minimize_controls(cls, table: UnionTable, instr: Instruction, qargs: Sequence[Qubit]):
         q_indices = [q._index for q in qargs]

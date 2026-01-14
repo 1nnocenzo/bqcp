@@ -176,12 +176,60 @@ class UnionTable:
         # Then set the target qubit to |0>
         self.qu_reg[qubit] = QubitStateOrTop(QubitState(1))
 
+    def collapse_measurement(self, qubit: int, outcome: int) -> bool:
+        """Collapse `qubit` to outcome (0/1). Return False if outcome impossible."""
+        if outcome not in (0, 1):
+            raise ValueError("outcome must be 0 or 1")
+
+        bit_val = bool(outcome)
+        single = QubitState(1)
+        single.clear()
+        single.state[(bit_val,)] = 1 + 0j
+
+        reg = self.qu_reg[qubit]
+        if reg.is_top():
+            self.qu_reg[qubit] = QubitStateOrTop(single)
+            return True
+
+        qs = reg.get_qubit_state()
+        idx = self.index_in_state(qubit)
+        prob = qs.probability_measure_one(idx) if bit_val else qs.probability_measure_zero(idx)
+        if prob < EPS:
+            return False
+
+        if qs.get_n_qubits() == 1:
+            self.qu_reg[qubit] = QubitStateOrTop(single)
+            return True
+
+        new_rest = QubitState(qs.get_n_qubits() - 1)
+        new_rest.clear()
+        for key, amp in qs.state.items():
+            if key[idx] == bit_val:
+                reduced = tuple(b for i, b in enumerate(key) if i != idx)
+                new_rest.state[reduced] = new_rest.state.get(reduced, 0) + amp
+
+        new_rest.normalize()
+        new_rest.remove_zero_entries()
+
+        group = self.qubits_in_state(qs)
+        for q in group:
+            if q == qubit:
+                continue
+            self.qu_reg[q] = QubitStateOrTop(new_rest)
+        self.qu_reg[qubit] = QubitStateOrTop(single)
+        return True
+
     def separate(self, qubit: int) -> None:
         reg = self.qu_reg[qubit]
         if reg.is_top() or not self.purity_test(qubit):
             return
 
         target = reg.get_qubit_state()
+
+        # If single qubit, nothing to do
+        if target.get_n_qubits() == 1:
+            return
+
         new_rest = QubitState(target.get_n_qubits() - 1)
         new_rest.clear()
 
