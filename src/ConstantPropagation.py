@@ -124,6 +124,21 @@ class ConstantPropagation:
         merged_clbits = cls._merge_clbit_states(branches)
         return _Branch(merged_table, merged_clbits)
 
+    @classmethod
+    def _apply_gate_and_check_effect(
+        cls,
+        table: UnionTable,
+        instr: Instruction,
+        qargs: Sequence[Qubit],
+        max_amplitudes: int,
+    ) -> bool:
+        if any(table.is_top(q._index) for q in qargs):
+            cls._apply_gate(table, instr, qargs, max_amplitudes)
+            return True
+        before = table.clone()
+        cls._apply_gate(table, instr, qargs, max_amplitudes)
+        return table != before
+
     @staticmethod
     def _eval_tuple_condition(instr_cond, cargs, clbit_states) -> Optional[bool]:
         _, val_exp = instr_cond
@@ -361,9 +376,17 @@ class ConstantPropagation:
             min_contr = cls._minimize_controls(merged_table, instr, qargs)
             if min_contr is not None:
                 instr_min_contr, qargs_min_contr = min_contr
+                changed_any = False
                 for br in branches:
-                    cls._apply_gate(br.table, instr_min_contr, qargs_min_contr, max_amplitudes)
-                new_circ.append(instr_min_contr, qargs_min_contr, cargs)
+                    if cls._apply_gate_and_check_effect(
+                        br.table,
+                        instr_min_contr,
+                        qargs_min_contr,
+                        max_amplitudes,
+                    ):
+                        changed_any = True
+                if changed_any:
+                    new_circ.append(instr_min_contr, qargs_min_contr, cargs)
 
         merged = cls._merge_branches(branches)
         return merged.table, new_circ
@@ -381,20 +404,38 @@ class ConstantPropagation:
         return new_circ
     
     @classmethod
-    def _construct_branch_circuit(cls, table, instr_branch):
+    def _construct_branch_circuit(cls, table, instr_branch, max_amplitudes: int | None = None):
         if instr_branch is None:
             return []
+        max_amplitudes = max_amplitudes or cls.MAX_AMPLITUDES
+        sim_table = table.clone() if table is not None else None
         qc_branch = []
         for inner_inst in instr_branch:
             qc_then_instr = inner_inst.operation
             qc_then_qargs = inner_inst.qubits
             qc_then_cargs = inner_inst.clbits
         
-            if table is not None:
-                min_contr = cls._minimize_controls(table, qc_then_instr, qc_then_qargs)
+            if sim_table is not None:
+                min_contr = cls._minimize_controls(sim_table, qc_then_instr, qc_then_qargs)
                 if min_contr is None:
                     continue # The inner operation will never be applied
                 qc_then_instr, qc_then_qargs = min_contr
+                name_lc = qc_then_instr.name.lower()
+                if name_lc in IGNORED_GATES:
+                    qc_branch.append((qc_then_instr, qc_then_qargs, qc_then_cargs))
+                    continue
+                if name_lc in UNSUPPORTED_GATES or name_lc in (MEASURE_NAME, RESET_NAME, IF_ELSE_NAME):
+                    for q in qc_then_qargs:
+                        sim_table.set_top(q._index)
+                    qc_branch.append((qc_then_instr, qc_then_qargs, qc_then_cargs))
+                    continue
+                if not cls._apply_gate_and_check_effect(
+                    sim_table,
+                    qc_then_instr,
+                    qc_then_qargs,
+                    max_amplitudes,
+                ):
+                    continue
             
             qc_branch.append((qc_then_instr, qc_then_qargs, qc_then_cargs))
         return qc_branch
@@ -432,8 +473,16 @@ class ConstantPropagation:
         table_then = cls._merge_tables([br.table for br in branches_then]) if branches_then else None
         table_else = cls._merge_tables([br.table for br in branches_else]) if branches_else else None
 
-        qc_then = cls._construct_branch_circuit(table_then, inst.params[0] if len(inst.params) > 0 else None)
-        qc_else = cls._construct_branch_circuit(table_else, inst.params[1] if len(inst.params) > 1 else None)
+        qc_then = cls._construct_branch_circuit(
+            table_then,
+            inst.params[0] if len(inst.params) > 0 else None,
+            max_amplitudes,
+        )
+        qc_else = cls._construct_branch_circuit(
+            table_else,
+            inst.params[1] if len(inst.params) > 1 else None,
+            max_amplitudes,
+        )
 
         merged_clbits = cls._merge_clbit_states(branches)
         cond_status, cond_expr = cls._simplify_condition_for_output(instr_cond, cargs, merged_clbits)

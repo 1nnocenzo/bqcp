@@ -168,9 +168,6 @@ class UnionTable:
 
     # After 'qubit' is set to 0, the other possibly entangled qubits in the state are set to top
     def reset_state(self, qubit: int) -> None:
-        self.set_top(qubit)
-        self.qu_reg[qubit] = QubitStateOrTop(QubitState(1))
-
         # Set all qubits in the same state to TOP
         self.set_top(qubit)
         # Then set the target qubit to |0>
