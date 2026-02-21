@@ -178,18 +178,31 @@ class ConstantPropagation:
 
     @staticmethod
     def _eval_tuple_condition(instr_cond, cargs, clbit_states) -> Optional[bool]:
-        _, val_exp = instr_cond
+        lhs, val_exp = instr_cond
+        val_exp = int(val_exp)
+
+        # Condition on a single classical bit, e.g. (Clbit, 0/1).
+        if isinstance(lhs, Clbit):
+            if val_exp not in (0, 1):
+                return False
+            st = clbit_states.get(lhs, BitState.ZERO)
+            if st == BitState.NOT_KNOWN:
+                return None
+            expected = 1 if st == BitState.ONE else 0
+            return expected == val_exp
+
+        # Register-like tuple condition: evaluate with local bit positions in cargs.
         mask = 0
         expected = 0
         all_known = True
-        for c in cargs:
+        for pos, c in enumerate(cargs):
             st = clbit_states.get(c, BitState.ZERO)
             if st == BitState.NOT_KNOWN:
                 all_known = False
                 continue
-            mask |= (1 << c._index)
+            mask |= (1 << pos)
             if st == BitState.ONE:
-                expected |= (1 << c._index)
+                expected |= (1 << pos)
         if all_known:
             return expected == val_exp
         if (val_exp & mask) != expected:
@@ -210,31 +223,44 @@ class ConstantPropagation:
     @classmethod
     def _simplify_condition_for_output(cls, instr_cond, cargs, clbit_states) -> Tuple[Optional[bool], Optional[object]]:
         if isinstance(instr_cond, tuple):
-            _, val_exp = instr_cond
+            lhs, val_exp = instr_cond
+            val_exp = int(val_exp)
+
+            # Condition on a single classical bit, e.g. (Clbit, 0/1).
+            if isinstance(lhs, Clbit):
+                if val_exp not in (0, 1):
+                    return False, None
+                st = clbit_states.get(lhs, BitState.ZERO)
+                if st == BitState.NOT_KNOWN:
+                    return None, (lhs, val_exp)
+                expected = 1 if st == BitState.ONE else 0
+                return (expected == val_exp), None
+
+            # Register-like tuple condition: simplify with local bit positions in cargs.
             mask = 0
             expected = 0
             not_determined_bits = []
             all_known = True
-            for c in cargs:
+            for pos, c in enumerate(cargs):
                 st = clbit_states.get(c, BitState.ZERO)
                 if st in (BitState.ZERO, BitState.ONE):
-                    mask |= (1 << c._index)
+                    mask |= (1 << pos)
                     if st == BitState.ONE:
-                        expected |= (1 << c._index)
+                        expected |= (1 << pos)
                 else:
                     all_known = False
-                    not_determined_bits.append(c)
+                    not_determined_bits.append((c, pos))
             if all_known:
                 return (expected == val_exp), None
             if (val_exp & mask) != expected:
                 return False, None
             if len(not_determined_bits) == 1:
-                c = not_determined_bits[0]
-                bit_val = 0 if (1 << c._index) & val_exp == 0 else 1
+                c, pos = not_determined_bits[0]
+                bit_val = (val_exp >> pos) & 1
                 return None, (c, bit_val)
             bits = []
-            for c in not_determined_bits:
-                bit_val = 0 if (1 << c._index) & val_exp == 0 else 1
+            for c, pos in not_determined_bits:
+                bit_val = (val_exp >> pos) & 1
                 bit = c if bit_val == 1 else expr.bit_not(c)
                 bits.append(bit)
             cond = reduce(expr.bit_and, bits)
@@ -384,7 +410,10 @@ class ConstantPropagation:
             for br in branches:
                 cls._check_amplitudes_branch(br, max_amplitudes)
 
-            if all(br.table.all_top() for br in branches) and name_lc != RESET_NAME:
+            if (
+                all(br.table.all_top() for br in branches)
+                and name_lc not in (RESET_NAME, MEASURE_NAME, IF_ELSE_NAME)
+            ):
                 new_circ.append(instr, qargs, cargs)
                 continue
 
