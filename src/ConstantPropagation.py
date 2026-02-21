@@ -34,7 +34,9 @@ def _single_qubit_matrix(instr: Instruction) -> List[complex]:
 
 def _two_qubit_matrix(instr: Instruction) -> List[List[complex]]:
     """Return a 4x4 nested list for two-qubit *instr*."""
-    mat = Operator(instr).data
+    base = instr.base_gate if isinstance(instr, ControlledGate) else instr
+
+    mat = Operator(base).data
 
     if mat.shape != (4, 4):
         raise ValueError("Instruction is not a two-qubit unitary")
@@ -43,8 +45,7 @@ def _two_qubit_matrix(instr: Instruction) -> List[List[complex]]:
 
 IGNORED_GATES: set[str] = {
     "barrier",
-    "delay",
-    "id"
+    "delay"
 }
 
 UNSUPPORTED_GATES: set[str] = {
@@ -135,9 +136,36 @@ class ConstantPropagation:
         if any(table.is_top(q._index) for q in qargs):
             cls._apply_gate(table, instr, qargs, max_amplitudes)
             return True
-        before = table.clone()
+
+        # When any qubit in the table is TOP return True
+        if any(reg.is_top() for reg in table.qu_reg):
+            cls._apply_gate(table, instr, qargs, max_amplitudes)
+            return True
+
+        # Snapshot only the connected components touched by qargs.
+        touched_state_ids = {id(table[q._index].get_qubit_state()) for q in qargs}
+        touched_qubits: List[int] = []
+        before_states_by_id: dict[int, object] = {}
+        before_by_index: dict[int, object] = {}
+        for idx, reg in enumerate(table.qu_reg):
+            qs = reg.get_qubit_state()
+            sid = id(qs)
+            if sid in touched_state_ids:
+                touched_qubits.append(idx)
+                if sid not in before_states_by_id:
+                    before_states_by_id[sid] = qs.clone()
+                before_by_index[idx] = before_states_by_id[sid]
+
         cls._apply_gate(table, instr, qargs, max_amplitudes)
-        return table != before
+
+        for idx in touched_qubits:
+            reg_after = table[idx]
+            if reg_after.is_top():
+                return True
+            if reg_after.get_qubit_state() != before_by_index[idx]:
+                return True
+
+        return False
 
     @staticmethod
     def _eval_tuple_condition(instr_cond, cargs, clbit_states) -> Optional[bool]:
@@ -522,7 +550,13 @@ class ConstantPropagation:
                 cls._apply_ops_to_table(new_br_else.table, qc_else, max_amplitudes)
                 next_branches.append(new_br_else)
 
-        return [cls._merge_branches(next_branches)]
+        # Trim branches down to max_branches by merging pairs from the end
+        while len(next_branches) > max_branches:
+            merged = cls._merge_branches(next_branches[-2:])
+            next_branches = next_branches[:-2] + [merged]
+
+        return next_branches
+
     @classmethod
     def _minimize_controls(cls, table: UnionTable, instr: Instruction, qargs: Sequence[Qubit]):
         q_indices = [q._index for q in qargs]
@@ -634,23 +668,3 @@ class ConstantPropagation:
         new_qargs = ctrl_qubits + list(target_qubits)
 
         return new_gate, new_qargs
-    
-    
-    @staticmethod
-    def _synthesize_rotation(state_vector, inverse = False) -> QuantumCircuit:
-        # Ensure the input state is normalized
-        state_vector = state_vector / np.linalg.norm(state_vector)
-        # Get the number of qubits needed (log2 of the length of state_vector)
-        n = int(np.log2(len(state_vector)))
-        # Create a QuantumCircuit with n qubits
-        qc = QuantumCircuit(n)
-        state_preparation = StatePreparation(state_vector)
-        # Append the state preparation to the quantum circuit
-        qc.append(state_preparation, range(n))
-        # Decompose the state preparation into individual gates
-        #qc = transpile(qc, basis_gates=['h', 'cx', 'rz', 'ry'])
-
-        if inverse:
-            return qc.inverse()
-        else:
-            return qc
