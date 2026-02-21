@@ -61,6 +61,7 @@ IF_ELSE_NAME = "if_else"
 class _Branch:
     table: UnionTable
     clbit_states: dict[Clbit, BitState]
+    table_shared: bool = False
 
 # ConstantPropagation main class
 class ConstantPropagation:
@@ -71,7 +72,15 @@ class ConstantPropagation:
 
     @staticmethod
     def _clone_branch(branch: _Branch) -> _Branch:
-        return _Branch(branch.table.clone(), dict(branch.clbit_states))
+        # Copy-on-write fork: share the table until one branch needs to mutate it.
+        branch.table_shared = True
+        return _Branch(branch.table, dict(branch.clbit_states), table_shared=True)
+
+    @staticmethod
+    def _ensure_writable_table(branch: _Branch) -> None:
+        if branch.table_shared:
+            branch.table = branch.table.clone()
+            branch.table_shared = False
 
     @staticmethod
     def _merge_clbit_states(branches: Sequence[_Branch]) -> dict[Clbit, BitState]:
@@ -290,6 +299,7 @@ class ConstantPropagation:
                 if clbits.get(c_ind, BitState.ZERO) != desired:
                     keep_instr = True
                 new_br = cls._clone_branch(br)
+                cls._ensure_writable_table(new_br)
                 new_br.table.collapse_measurement(q_ind, outcome)
                 new_br.clbit_states[c_ind] = desired
                 new_branches.append(new_br)
@@ -299,12 +309,14 @@ class ConstantPropagation:
             if len(new_branches) + 2 <= max_branches:
                 for outcome in (0, 1):
                     new_br = cls._clone_branch(br)
+                    cls._ensure_writable_table(new_br)
                     if not new_br.table.collapse_measurement(q_ind, outcome):
                         continue
                     new_br.clbit_states[c_ind] = BitState.ZERO if outcome == 0 else BitState.ONE
                     new_branches.append(new_br)
             else:
                 new_br = cls._clone_branch(br)
+                cls._ensure_writable_table(new_br)
                 new_br.table.set_top(q_ind)
                 new_br.clbit_states[c_ind] = BitState.NOT_KNOWN
                 new_branches.append(new_br)
@@ -327,9 +339,20 @@ class ConstantPropagation:
 
         if keep_instr:
             for br in branches:
+                cls._ensure_writable_table(br)
                 br.table.reset_state(qubit_index)
         return keep_instr
-    
+
+    @classmethod
+    def _check_amplitudes_branch(cls, branch: _Branch, max_amplitudes: int) -> None:
+        table = branch.table
+        for i in range(table.size()):
+            reg = table[i]
+            if reg.is_qubit_state() and reg.get_qubit_state().size() > max_amplitudes:
+                cls._ensure_writable_table(branch)
+                branch.table.set_top(i)
+                table = branch.table
+
     @classmethod
     def _propagate(
         cls,
@@ -359,7 +382,7 @@ class ConstantPropagation:
             name_lc = instr.name.lower()
 
             for br in branches:
-                cls._check_amplitudes(br.table, max_amplitudes)
+                cls._check_amplitudes_branch(br, max_amplitudes)
 
             if all(br.table.all_top() for br in branches) and name_lc != RESET_NAME:
                 new_circ.append(instr, qargs, cargs)
@@ -373,6 +396,7 @@ class ConstantPropagation:
             # Unsupported or classically-controlled operations
             if name_lc in UNSUPPORTED_GATES:
                 for br in branches:
+                    cls._ensure_writable_table(br)
                     for t in q_indices:
                         br.table.set_top(t)
                 new_circ.append(instr, qargs, cargs)
@@ -406,6 +430,7 @@ class ConstantPropagation:
                 instr_min_contr, qargs_min_contr = min_contr
                 changed_any = False
                 for br in branches:
+                    cls._ensure_writable_table(br)
                     if cls._apply_gate_and_check_effect(
                         br.table,
                         instr_min_contr,
@@ -536,18 +561,26 @@ class ConstantPropagation:
         for br, cond_eval in zip(branches, cond_evals):
             if cond_eval is True:
                 new_br = cls._clone_branch(br)
-                cls._apply_ops_to_table(new_br.table, qc_then, max_amplitudes)
+                if qc_then:
+                    cls._ensure_writable_table(new_br)
+                    cls._apply_ops_to_table(new_br.table, qc_then, max_amplitudes)
                 next_branches.append(new_br)
             elif cond_eval is False:
                 new_br = cls._clone_branch(br)
-                cls._apply_ops_to_table(new_br.table, qc_else, max_amplitudes)
+                if qc_else:
+                    cls._ensure_writable_table(new_br)
+                    cls._apply_ops_to_table(new_br.table, qc_else, max_amplitudes)
                 next_branches.append(new_br)
             else:
                 new_br_then = cls._clone_branch(br)
-                cls._apply_ops_to_table(new_br_then.table, qc_then, max_amplitudes)
+                if qc_then:
+                    cls._ensure_writable_table(new_br_then)
+                    cls._apply_ops_to_table(new_br_then.table, qc_then, max_amplitudes)
                 next_branches.append(new_br_then)
                 new_br_else = cls._clone_branch(br)
-                cls._apply_ops_to_table(new_br_else.table, qc_else, max_amplitudes)
+                if qc_else:
+                    cls._ensure_writable_table(new_br_else)
+                    cls._apply_ops_to_table(new_br_else.table, qc_else, max_amplitudes)
                 next_branches.append(new_br_else)
 
         # Trim branches down to max_branches by merging pairs from the end
@@ -621,7 +654,7 @@ class ConstantPropagation:
         idx_ctrl = table.index_in_state_list(list(controls))
         matrix = _single_qubit_matrix(instr)
         table[target].get_qubit_state().apply_gate(idx_t, matrix, idx_ctrl)
-
+        
         # Separates states of disentangled qubits after gate application
         table.separate(target)
 
