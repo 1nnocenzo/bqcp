@@ -2,7 +2,6 @@
 A qubit state is represented as a map bit_string -> amplitude (e.g., |00> -> 0.5, |11> -> 0.5)
 """
 
-from copy import deepcopy
 from typing import Dict, Tuple, List, Optional, Union
 import numpy as np
 
@@ -30,7 +29,9 @@ class QubitState:
         self.state.clear()
 
     def clone(self) -> 'QubitState':
-        return deepcopy(self)
+        new = QubitState(self.n_qubits)
+        new.state = self.state.copy()
+        return new
 
     def __str__(self) -> str:
         entries = sorted(self.state.items())
@@ -215,18 +216,18 @@ class QubitState:
         self.state = new_state
         self.remove_zero_entries()
 
-    def reorder_index(self, old_i: int, new_i: int) -> None:
-        if old_i == new_i:
-            return
-        if not (0 <= old_i < self.n_qubits and 0 <= new_i < self.n_qubits):
-            raise IndexError("Qubit index out of range")
-        new_state: Dict[StateKey, complex] = {}
-        for k, v in self.state.items():
-            lst = list(k)
-            bit = lst.pop(old_i)
-            lst.insert(new_i, bit)
-            new_state[tuple(lst)] = v
-        self.state = new_state
+    # def reorder_index(self, old_i: int, new_i: int) -> None:
+    #     if old_i == new_i:
+    #         return
+    #     if not (0 <= old_i < self.n_qubits and 0 <= new_i < self.n_qubits):
+    #         raise IndexError("Qubit index out of range")
+    #     new_state: Dict[StateKey, complex] = {}
+    #     for k, v in self.state.items():
+    #         lst = list(k)
+    #         bit = lst.pop(old_i)
+    #         lst.insert(new_i, bit)
+    #         new_state[tuple(lst)] = v
+    #     self.state = new_state
 
     @staticmethod
     def combine(qs1: 'QubitState', indices1: List[int], qs2: 'QubitState', indices2: List[int]) -> 'QubitState':

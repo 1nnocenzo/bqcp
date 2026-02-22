@@ -135,6 +135,19 @@ class ConstantPropagation:
         return _Branch(merged_table, merged_clbits)
 
     @classmethod
+    def _enforce_branch_cap(
+        cls,
+        branches: Sequence[_Branch],
+        max_branches: int,
+    ) -> List[_Branch]:
+        cap = max(1, int(max_branches))
+        capped = list(branches)
+        while len(capped) > cap:
+            merged = cls._merge_branches(capped[-2:])
+            capped = capped[:-2] + [merged]
+        return capped
+
+    @classmethod
     def _apply_gate_and_check_effect(
         cls,
         table: UnionTable,
@@ -301,6 +314,7 @@ class ConstantPropagation:
         c_ind = inst.clbits[0]
         new_branches: List[_Branch] = []
         keep_instr = False
+        remaining_splits = max(0, int(max_branches) - len(branches))
 
         for br in branches:
             table = br.table
@@ -332,14 +346,27 @@ class ConstantPropagation:
                 continue
 
             keep_instr = True
-            if len(new_branches) + 2 <= max_branches:
-                for outcome in (0, 1):
+            successors: List[_Branch] = []
+            for meas_outcome in (0, 1):
+                new_br = cls._clone_branch(br)
+                cls._ensure_writable_table(new_br)
+                if not new_br.table.collapse_measurement(q_ind, meas_outcome):
+                    continue
+                new_br.clbit_states[c_ind] = BitState.ZERO if meas_outcome == 0 else BitState.ONE
+                successors.append(new_br)
+
+            if len(successors) == 2:
+                if remaining_splits > 0:
+                    remaining_splits -= 1
+                    new_branches.extend(successors)
+                else:
                     new_br = cls._clone_branch(br)
                     cls._ensure_writable_table(new_br)
-                    if not new_br.table.collapse_measurement(q_ind, outcome):
-                        continue
-                    new_br.clbit_states[c_ind] = BitState.ZERO if outcome == 0 else BitState.ONE
+                    new_br.table.set_top(q_ind)
+                    new_br.clbit_states[c_ind] = BitState.NOT_KNOWN
                     new_branches.append(new_br)
+            elif len(successors) == 1:
+                new_branches.extend(successors)
             else:
                 new_br = cls._clone_branch(br)
                 cls._ensure_writable_table(new_br)
@@ -347,7 +374,7 @@ class ConstantPropagation:
                 new_br.clbit_states[c_ind] = BitState.NOT_KNOWN
                 new_branches.append(new_br)
 
-        return new_branches, keep_instr
+        return cls._enforce_branch_cap(new_branches, max_branches), keep_instr
 
     @classmethod
     def _handle_reset(cls, branches: Sequence[_Branch], qubit_index: int) -> bool:
@@ -612,12 +639,7 @@ class ConstantPropagation:
                     cls._apply_ops_to_table(new_br_else.table, qc_else, max_amplitudes)
                 next_branches.append(new_br_else)
 
-        # Trim branches down to max_branches by merging pairs from the end
-        while len(next_branches) > max_branches:
-            merged = cls._merge_branches(next_branches[-2:])
-            next_branches = next_branches[:-2] + [merged]
-
-        return next_branches
+        return cls._enforce_branch_cap(next_branches, max_branches)
 
     @classmethod
     def _minimize_controls(cls, table: UnionTable, instr: Instruction, qargs: Sequence[Qubit]):

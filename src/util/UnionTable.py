@@ -1,5 +1,4 @@
 from typing import List, Tuple, Dict, Optional
-from copy import deepcopy
 
 from util.QubitState import QubitState, QubitStateOrTop, EPS
 from util.ActivationState import *
@@ -64,7 +63,7 @@ class UnionTable:
         if reg.is_top():
             return False
 
-        qs = deepcopy(reg.get_qubit_state())
+        qs = reg.get_qubit_state()
         idx = self.index_in_state(qubit)
 
         a0: Dict[Tuple[bool, ...], complex] = {}
@@ -243,7 +242,7 @@ class UnionTable:
             # Remove the idx-th bit to form the reduced key
             reduced = tuple(b for i, b in enumerate(key) if i != idx)
 
-            # Only set if not present OR present as exact zero (to mirror C++'s == 0 check)
+            # Only set if not present OR present as exact zero
             if (reduced not in new_rest.state) or (new_rest.state[reduced] == 0):
                 denom = alpha if (key[idx] is False) else beta
                 new_rest.state[reduced] = value / denom
