@@ -159,17 +159,14 @@ class ConstantPropagation:
             cls._apply_gate(table, instr, qargs, max_amplitudes)
             return True
 
-        # When any qubit in the table is TOP return True
-        if any(reg.is_top() for reg in table.qu_reg):
-            cls._apply_gate(table, instr, qargs, max_amplitudes)
-            return True
-
         # Snapshot only the connected components touched by qargs.
         touched_state_ids = {id(table[q._index].get_qubit_state()) for q in qargs}
         touched_qubits: List[int] = []
         before_states_by_id: dict[int, object] = {}
         before_by_index: dict[int, object] = {}
         for idx, reg in enumerate(table.qu_reg):
+            if reg.is_top():
+                continue
             qs = reg.get_qubit_state()
             sid = id(qs)
             if sid in touched_state_ids:
@@ -614,6 +611,7 @@ class ConstantPropagation:
                             new_circ.append(qc_else_instr, qc_else_qargs, qc_else_cargs)
 
         next_branches: List[_Branch] = []
+        remaining_splits = max(0, int(max_branches) - len(branches))
         for br, cond_eval in zip(branches, cond_evals):
             if cond_eval is True:
                 new_br = cls._clone_branch(br)
@@ -621,23 +619,48 @@ class ConstantPropagation:
                     cls._ensure_writable_table(new_br)
                     cls._apply_ops_to_table(new_br.table, qc_then, max_amplitudes)
                 next_branches.append(new_br)
-            elif cond_eval is False:
+                continue
+
+            if cond_eval is False:
                 new_br = cls._clone_branch(br)
                 if qc_else:
                     cls._ensure_writable_table(new_br)
                     cls._apply_ops_to_table(new_br.table, qc_else, max_amplitudes)
                 next_branches.append(new_br)
-            else:
+                continue
+
+            # cond_eval is unknown
+            if remaining_splits > 0:
+                remaining_splits -= 1
                 new_br_then = cls._clone_branch(br)
                 if qc_then:
                     cls._ensure_writable_table(new_br_then)
                     cls._apply_ops_to_table(new_br_then.table, qc_then, max_amplitudes)
                 next_branches.append(new_br_then)
+
                 new_br_else = cls._clone_branch(br)
                 if qc_else:
                     cls._ensure_writable_table(new_br_else)
                     cls._apply_ops_to_table(new_br_else.table, qc_else, max_amplitudes)
                 next_branches.append(new_br_else)
+                continue
+
+            # No split budget left: conservatively join then/else effects for this branch.
+            if not qc_then and not qc_else:
+                next_branches.append(cls._clone_branch(br))
+                continue
+
+            br_then = cls._clone_branch(br)
+            if qc_then:
+                cls._ensure_writable_table(br_then)
+                cls._apply_ops_to_table(br_then.table, qc_then, max_amplitudes)
+
+            br_else = cls._clone_branch(br)
+            if qc_else:
+                cls._ensure_writable_table(br_else)
+                cls._apply_ops_to_table(br_else.table, qc_else, max_amplitudes)
+
+            next_branches.append(cls._merge_branches([br_then, br_else]))
 
         return cls._enforce_branch_cap(next_branches, max_branches)
 
