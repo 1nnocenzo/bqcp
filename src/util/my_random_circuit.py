@@ -156,12 +156,12 @@ def random_circuit(
         (standard_gates.CCXGate, 3, 0),
         (standard_gates.CSwapGate, 3, 0),
         (standard_gates.CCZGate, 3, 0),
-        (standard_gates.RCCXGate, 3, 0),
+        # (standard_gates.RCCXGate, 3, 0),
     ]
 
     gates_4q = [
         (standard_gates.C3SXGate, 4, 0),
-        (standard_gates.RC3XGate, 4, 0),
+        # (standard_gates.RC3XGate, 4, 0),
     ]
 
     gates_1q = np.array(
@@ -186,6 +186,53 @@ def random_circuit(
         distribution.extend([ratio / len(gate_list)] * len(gate_list))
 
     gates = np.array(gates_to_consider, dtype=gates_1q.dtype)
+    active_operand_counts = [width for width, ratio in num_operand_distribution.items() if ratio > 0]
+    min_active_operands = min(active_operand_counts)
+
+    def _sample_gate_spec_for_qubit_budget(qubit_budget):
+        valid_widths = [
+            width
+            for width in active_operand_counts
+            if width <= qubit_budget
+        ]
+        if not valid_widths:
+            return None
+        width_probs = np.array([num_operand_distribution[width] for width in valid_widths], dtype=float)
+        width_probs /= width_probs.sum()
+        chosen_width = int(rng.choice(valid_widths, p=width_probs))
+        gate_pool = all_gate_lists[chosen_width - 1]
+        return gate_pool[rng.integers(0, len(gate_pool))]
+
+    def _build_subset_condition(bits):
+        if len(bits) == 1:
+            bit_val = int(rng.choice([0, 1]))
+            return (bits[0], bit_val)
+
+        condition = bits[0]
+        for bit in bits[1:]:
+            if rng.random() < 0.2:
+                bit = expr.bit_not(bit)
+            op = rng.choice(["and", "or", "xor"])
+            if op == "and":
+                condition = expr.bit_and(condition, bit)
+            elif op == "or":
+                condition = expr.bit_or(condition, bit)
+            else:
+                condition = expr.bit_xor(condition, bit)
+        return condition
+
+    def _append_random_conditional_ops(available_qubits, num_ops):
+        for _ in range(num_ops):
+            cond_gate_spec = _sample_gate_spec_for_qubit_budget(len(available_qubits))
+            if cond_gate_spec is None:
+                break
+            cond_gate = cond_gate_spec["class"]
+            cond_num_qubits = int(cond_gate_spec["num_qubits"])
+            cond_num_params = int(cond_gate_spec["num_params"])
+            cond_parameters = rng.uniform(0, 2 * np.pi, size=cond_num_params)
+            cond_qargs = list(rng.choice(available_qubits, size=cond_num_qubits, replace=False))
+            cond_operation = cond_gate(*cond_parameters)
+            qc.append(CircuitInstruction(operation=cond_operation, qubits=cond_qargs))
 
     qc = QuantumCircuit(num_qubits)
 
@@ -264,59 +311,51 @@ def random_circuit(
         # conditional check is outside the two loops to make the more common case of no conditionals
         # faster, since in Python we don't have a compiler to do this for us.
         if conditional and layer_number != 0:
-            is_conditional = rng.random(size=len(gate_specs)) < 0.1
-            for gate, q_start, q_end, p_start, p_end, is_cond in zip(
+            insert_conditional_block = rng.random(size=len(gate_specs)) < 0.1
+            for gate, q_start, q_end, p_start, p_end, add_conditional_block in zip(
                 gate_specs["class"],
                 q_indices[:-1],
                 q_indices[1:],
                 p_indices[:-1],
                 p_indices[1:],
-                is_conditional,
+                insert_conditional_block,
             ):
+                if add_conditional_block:
+                    # Reserve enough unmeasured qubits to always place at least one operation.
+                    max_num_meas = num_qubits - min_active_operands
+                    if max_num_meas >= 1:
+                        num_meas = int(rng.integers(1, max_num_meas + 1))
+                        measured_indices = np.sort(rng.choice(num_qubits, size=num_meas, replace=False))
+                        measured_set = {int(index) for index in measured_indices}
+                        bits = [cr[int(index)] for index in measured_indices]
+                        available_qubits = [
+                            qc.qubits[index] for index in range(num_qubits) if index not in measured_set
+                        ]
+
+                        # Measure only the selected qubits and map q[i] -> c[i].
+                        for index in measured_indices:
+                            idx = int(index)
+                            qc.measure(qc.qubits[idx], cr[idx])
+
+                        if rng.random() < 0.5:
+                            for index in measured_indices:
+                                qc.reset(qc.qubits[int(index)])
+
+                        condition = _build_subset_condition(bits)
+                        num_then_ops = int(rng.integers(5, 25))
+                        has_else_branch = bool(rng.random() < 0.5)
+                        if has_else_branch:
+                            num_else_ops = int(rng.integers(5, 25))
+                            with qc.if_test(condition) as else_:
+                                _append_random_conditional_ops(available_qubits, num_then_ops)
+                            with else_:
+                                _append_random_conditional_ops(available_qubits, num_else_ops)
+                        else:
+                            with qc.if_test(condition):
+                                _append_random_conditional_ops(available_qubits, num_then_ops)
+
                 operation = gate(*parameters[p_start:p_end])
-
-                if is_cond:
-                    num_meas = int(rng.integers(1, num_qubits + 1))
-                    measured_indices = np.sort(rng.choice(num_qubits, size=num_meas, replace=False))
-                    bits = [cr[int(index)] for index in measured_indices]
-
-                    # Measure only the selected qubits and map q[i] -> c[i].
-                    for index in measured_indices:
-                        idx = int(index)
-                        qc.measure(qc.qubits[idx], cr[idx])
-
-                    if num_meas == 1:
-                        bit_val = int(rng.choice([0, 1]))
-                        condition = (bits[0], bit_val)
-                    elif num_meas == num_qubits:
-                        # Build the register value as a Python int to avoid fixed-width overflow.
-                        value = 0
-                        for index in range(num_qubits):
-                            if rng.random() < 0.5:
-                                value |= 1 << index
-                        condition = (cr, value)
-                    else:
-                        # Build a random Boolean expression over the measured bits.
-                        condition = bits[0]
-                        for bit in bits[1:]:
-                            if rng.random() < 0.2:
-                                bit = expr.bit_not(bit)
-                            op = rng.choice(["and", "or", "xor"])
-                            if op == "and":
-                                condition = expr.bit_and(condition, bit)
-                            elif op == "or":
-                                condition = expr.bit_or(condition, bit)
-                            else:
-                                condition = expr.bit_xor(condition, bit)
-
-                    with qc.if_test(condition):
-                        qc.append(
-                            CircuitInstruction(operation=operation, qubits=qubits[q_start:q_end])
-                        )
-                else:
-                    qc._append(
-                        CircuitInstruction(operation=operation, qubits=qubits[q_start:q_end])
-                    )
+                qc._append(CircuitInstruction(operation=operation, qubits=qubits[q_start:q_end]))
         else:
             for gate, q_start, q_end, p_start, p_end in zip(
                 gate_specs["class"], q_indices[:-1], q_indices[1:], p_indices[:-1], p_indices[1:]
