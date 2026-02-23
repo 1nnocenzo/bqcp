@@ -510,40 +510,110 @@ class ConstantPropagation:
         return new_circ
     
     @classmethod
-    def _construct_branch_circuit(cls, table, instr_branch, max_amplitudes: int | None = None):
+    def _construct_branch_circuit(
+        cls,
+        branch_tables,
+        instr_branch,
+        max_amplitudes: int | None = None,
+    ):
         if instr_branch is None:
             return []
+
         max_amplitudes = max_amplitudes or cls.MAX_AMPLITUDES
-        sim_table = table.clone() if table is not None else None
+
+        # Accept either a single table (legacy call) or a list of per-branch tables.
+        if branch_tables is None:
+            sim_tables: List[UnionTable] = []
+        elif isinstance(branch_tables, list):
+            sim_tables = [t.clone() for t in branch_tables]
+        else:
+            sim_tables = [branch_tables.clone()]
+
         qc_branch = []
+
+        def _sig(min_res):
+            instr, qargs = min_res
+            return (
+                instr.name,
+                getattr(instr, "num_ctrl_qubits", 0),
+                tuple(q._index for q in qargs),
+                tuple(
+                    float(p) if isinstance(p, (int, float)) else str(p)
+                    for p in getattr(instr, "params", [])
+                ),
+            )
+
         for inner_inst in instr_branch:
-            qc_then_instr = inner_inst.operation
-            qc_then_qargs = inner_inst.qubits
-            qc_then_cargs = inner_inst.clbits
-        
-            if sim_table is not None:
-                min_contr = cls._minimize_controls(sim_table, qc_then_instr, qc_then_qargs)
-                if min_contr is None:
-                    continue # The inner operation will never be applied
-                qc_then_instr, qc_then_qargs = min_contr
-                name_lc = qc_then_instr.name.lower()
+            base_instr = inner_inst.operation
+            base_qargs = inner_inst.qubits
+            base_cargs = inner_inst.clbits
+
+            if not sim_tables:
+                qc_branch.append((base_instr, base_qargs, base_cargs))
+                continue
+
+            # Compute local minimization once per branch-table and reuse it.
+            local_min = [cls._minimize_controls(tab, base_instr, base_qargs) for tab in sim_tables]
+            active_locals = [m for m in local_min if m is not None]
+
+            if not active_locals:
+                # Never active across all current tables.
+                continue
+
+            # Output minimization:
+            # - use a common local minimization when all branches agree,
+            # - otherwise fallback to merged-table minimization (conservative).
+            use_common = False
+            if len(active_locals) == len(sim_tables):
+                s0 = _sig(active_locals[0])
+                if all(_sig(m) == s0 for m in active_locals[1:]):
+                    use_common = True
+
+            if use_common:
+                out_instr, out_qargs = active_locals[0]
+            else:
+                merged_for_output = cls._merge_tables(sim_tables)
+                min_out = cls._minimize_controls(merged_for_output, base_instr, base_qargs)
+                if min_out is None:
+                    continue
+                out_instr, out_qargs = min_out
+
+            # Branch-sensitive simulation to avoid losing cross-branch correlations.
+            changed_any = False
+            for tab, min_local in zip(sim_tables, local_min):
+                if min_local is None:
+                    continue
+
+                loc_instr, loc_qargs = min_local
+                name_lc = loc_instr.name.lower()
+
                 if name_lc in IGNORED_GATES:
-                    qc_branch.append((qc_then_instr, qc_then_qargs, qc_then_cargs))
                     continue
+
                 if name_lc in UNSUPPORTED_GATES or name_lc in (MEASURE_NAME, RESET_NAME, IF_ELSE_NAME):
-                    for q in qc_then_qargs:
-                        sim_table.set_top(q._index)
-                    qc_branch.append((qc_then_instr, qc_then_qargs, qc_then_cargs))
+                    for q in loc_qargs:
+                        tab.set_top(q._index)
+                    changed_any = True
                     continue
-                if not cls._apply_gate_and_check_effect(
-                    sim_table,
-                    qc_then_instr,
-                    qc_then_qargs,
+
+                if cls._apply_gate_and_check_effect(
+                    tab,
+                    loc_instr,
+                    loc_qargs,
                     max_amplitudes,
                 ):
-                    continue
-            
-            qc_branch.append((qc_then_instr, qc_then_qargs, qc_then_cargs))
+                    changed_any = True
+
+            out_name = out_instr.name.lower()
+            if out_name in IGNORED_GATES:
+                qc_branch.append((out_instr, out_qargs, base_cargs))
+                continue
+            if out_name in UNSUPPORTED_GATES or out_name in (MEASURE_NAME, RESET_NAME, IF_ELSE_NAME):
+                qc_branch.append((out_instr, out_qargs, base_cargs))
+                continue
+            if changed_any:
+                qc_branch.append((out_instr, out_qargs, base_cargs))
+
         return qc_branch
     
     @classmethod
@@ -576,22 +646,25 @@ class ConstantPropagation:
                 branches_then.append(br)
                 branches_else.append(br)
 
-        table_then = cls._merge_tables([br.table for br in branches_then]) if branches_then else None
-        table_else = cls._merge_tables([br.table for br in branches_else]) if branches_else else None
-
         qc_then = cls._construct_branch_circuit(
-            table_then,
+            [br.table for br in branches_then],
             inst.params[0] if len(inst.params) > 0 else None,
             max_amplitudes,
         )
         qc_else = cls._construct_branch_circuit(
-            table_else,
+            [br.table for br in branches_else],
             inst.params[1] if len(inst.params) > 1 else None,
             max_amplitudes,
         )
 
-        merged_clbits = cls._merge_clbit_states(branches)
-        cond_status, cond_expr = cls._simplify_condition_for_output(instr_cond, cargs, merged_clbits)
+        if all(ev is True for ev in cond_evals):
+            cond_status, cond_expr = True, None
+        elif all(ev is False for ev in cond_evals):
+            cond_status, cond_expr = False, None
+        else:
+            merged_clbits = cls._merge_clbit_states(branches)
+            _, cond_expr = cls._simplify_condition_for_output(instr_cond, cargs, merged_clbits)
+            cond_status = None
 
         if cond_status is True:
             for qc_then_instr, qc_then_qargs, qc_then_cargs in qc_then:
