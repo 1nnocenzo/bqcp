@@ -151,7 +151,7 @@ class UnionTable:
         if not others:
             return (ActivationState.ALWAYS if not minimized else ActivationState.UNKNOWN), minimized
 
-        # Group by shared QubitState
+        # Group controls by shared QubitState (same entangled block)
         groups: Dict[int, List[int]] = {}
         for c in others:
             sid = id(self.qu_reg[c].get_qubit_state())
@@ -160,10 +160,28 @@ class UnionTable:
         for group in groups.values():
             if len(group) == 1:
                 minimized.extend(group)
-            else:
-                minimized.extend(group)
+                continue
 
-        return (ActivationState.SOMETIMES if not minimized else ActivationState.UNKNOWN), minimized
+            # Multi-control group: exploit joint activation on the shared state.
+            qs = self.qu_reg[group[0]].get_qubit_state()
+            idxs = [self.index_in_state(c) for c in group]
+
+            # No basis assignment in this group can satisfy all controls => gate never activates.
+            if qs.never_activated(idxs):
+                return ActivationState.NEVER, []
+
+            # Group is always 1 together => controls in this group are redundant.
+            if qs.always_activated(idxs):
+                continue
+
+            # Partial activation: keep controls conservatively.
+            minimized.extend(group)
+
+        if not minimized:
+            return ActivationState.ALWAYS, []
+        if any(self.qu_reg[c].is_top() for c in minimized):
+            return ActivationState.UNKNOWN, minimized
+        return ActivationState.SOMETIMES, minimized
 
     # After 'qubit' is set to 0, the other possibly entangled qubits in the state are set to top
     def reset_state(self, qubit: int) -> None:

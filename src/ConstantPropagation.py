@@ -476,23 +476,54 @@ class ConstantPropagation:
                     new_circ.append(instr, qargs, cargs)
                 continue
 
-            
-            merged_table = cls._merge_tables([br.table for br in branches])
-            min_contr = cls._minimize_controls(merged_table, instr, qargs)
-            if min_contr is not None:
-                instr_min_contr, qargs_min_contr = min_contr
-                changed_any = False
-                for br in branches:
-                    cls._ensure_writable_table(br)
-                    if cls._apply_gate_and_check_effect(
-                        br.table,
-                        instr_min_contr,
-                        qargs_min_contr,
-                        max_amplitudes,
-                    ):
-                        changed_any = True
-                if changed_any:
-                    new_circ.append(instr_min_contr, qargs_min_contr, cargs)
+            # Branch-sensitive minimization at top-level:
+            # simulate with each branch-local minimization to preserve cross-branch correlations.
+            local_min = [cls._minimize_controls(br.table, instr, qargs) for br in branches]
+            active_locals = [m for m in local_min if m is not None]
+
+            if not active_locals:
+                # Never active across all current branches.
+                continue
+
+            def _sig(min_res):
+                min_instr, min_qargs = min_res
+                return (
+                    min_instr.name,
+                    getattr(min_instr, "num_ctrl_qubits", 0),
+                    tuple(q._index for q in min_qargs),
+                    tuple(
+                        float(p) if isinstance(p, (int, float)) else str(p)
+                        for p in getattr(min_instr, "params", [])
+                    ),
+                )
+
+            # Emit a minimized gate only when all branches agree on the same local minimization.
+            use_common = False
+            if len(active_locals) == len(branches):
+                s0 = _sig(active_locals[0])
+                if all(_sig(m) == s0 for m in active_locals[1:]):
+                    use_common = True
+
+            if use_common:
+                out_instr, out_qargs = active_locals[0]
+            else:
+                out_instr, out_qargs = instr, qargs
+
+            changed_any = False
+            for br, min_local in zip(branches, local_min):
+                if min_local is None:
+                    continue
+                cls._ensure_writable_table(br)
+                loc_instr, loc_qargs = min_local
+                if cls._apply_gate_and_check_effect(
+                    br.table,
+                    loc_instr,
+                    loc_qargs,
+                    max_amplitudes,
+                ):
+                    changed_any = True
+            if changed_any:
+                new_circ.append(out_instr, out_qargs, cargs)
 
         merged = cls._merge_branches(branches)
         return merged.table, new_circ
