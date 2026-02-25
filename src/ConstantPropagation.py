@@ -147,6 +147,43 @@ class ConstantPropagation:
             capped = capped[:-2] + [merged]
         return capped
 
+    @staticmethod
+    def _equal_qubit_states_up_to_global_phase(state_a, state_b, tol: float = EPS) -> bool:
+        if state_a.get_n_qubits() != state_b.get_n_qubits():
+            return False
+
+        amps_a = {
+            basis: amp
+            for basis, amp in state_a.get_quantum_state().items()
+            if abs(amp) > tol
+        }
+        amps_b = {
+            basis: amp
+            for basis, amp in state_b.get_quantum_state().items()
+            if abs(amp) > tol
+        }
+
+        if set(amps_a.keys()) != set(amps_b.keys()):
+            return False
+        if not amps_a:
+            return True
+
+        pivot = next(iter(amps_a))
+        denom = amps_b[pivot]
+        if abs(denom) <= tol:
+            return False
+
+        phase = amps_a[pivot] / denom
+        phase_norm = abs(phase)
+        if phase_norm <= tol:
+            return False
+        phase /= phase_norm
+
+        for basis, amp_a in amps_a.items():
+            if abs(amp_a - phase * amps_b[basis]) > 10 * tol:
+                return False
+        return True
+
     @classmethod
     def _apply_gate_and_check_effect(
         cls,
@@ -181,7 +218,10 @@ class ConstantPropagation:
             reg_after = table[idx]
             if reg_after.is_top():
                 return True
-            if reg_after.get_qubit_state() != before_by_index[idx]:
+            if not cls._equal_qubit_states_up_to_global_phase(
+                reg_after.get_qubit_state(),
+                before_by_index[idx],
+            ):
                 return True
 
         return False
