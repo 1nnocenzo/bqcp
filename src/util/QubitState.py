@@ -1,7 +1,3 @@
-"""
-A qubit state is represented as a map bit_string -> amplitude (e.g., |00> -> 0.5, |11> -> 0.5)
-"""
-
 from typing import Dict, Tuple, List, Optional, Union
 import numpy as np
 
@@ -77,7 +73,7 @@ class QubitState:
         qs.clear()
         for idx, amp in enumerate(vector):
             if abs(amp) > EPS:
-                # convert idx to bit tuple
+                # Convert idx to bit tuple
                 key = tuple(bool((idx >> i) & 1) for i in range(n_qubits))
                 qs.state[key] = amp
         return qs
@@ -116,21 +112,21 @@ class QubitState:
             beta  = self.state.get((True,), 0)
             return alpha, beta
         
-        # Manage multi-qubit states
-        dm = np.zeros((2,2), dtype=complex)
-        
-        for (k1, v1) in self.state.items():
-            for (k2, v2) in self.state.items():
+        dm = np.zeros((2, 2), dtype=complex)
+        grouped: Dict[StateKey, List[complex]] = {}
+        for key, amp in self.state.items():
+            rest = key[:index] + key[index + 1:]
+            entry = grouped.get(rest)
+            if entry is None:
+                entry = [0j, 0j]
+                grouped[rest] = entry
+            entry[1 if key[index] else 0] += complex(amp)
 
-                k1_bit = 1 if k1[index] else 0
-                k2_bit = 1 if k2[index] else 0
-
-                # Remove that bit and compare the remaining substrings
-                k1_rest = k1[:index] + k1[index+1:]
-                k2_rest = k2[:index] + k2[index+1:]
-
-                if k1_rest == k2_rest:
-                    dm[k1_bit, k2_bit] += complex(v1) * np.conj(complex(v2))
+        for amp0, amp1 in grouped.values():
+            dm[0, 0] += amp0 * np.conj(amp0)
+            dm[0, 1] += amp0 * np.conj(amp1)
+            dm[1, 0] += amp1 * np.conj(amp0)
+            dm[1, 1] += amp1 * np.conj(amp1)
 
         # Eigen decomposition
         eigvals, eigvecs = np.linalg.eigh(dm)
@@ -188,7 +184,6 @@ class QubitState:
 
     def apply_two_qubit_gate(self, t1: int, t2: int, matrix: List[List[complex]], controls: Optional[List[int]] = None) -> None:
         if controls:
-            # similar split
             activated = QubitState(self.n_qubits)
             activated.clear()
             deactivated = QubitState(self.n_qubits)
@@ -216,22 +211,9 @@ class QubitState:
         self.state = new_state
         self.remove_zero_entries()
 
-    # def reorder_index(self, old_i: int, new_i: int) -> None:
-    #     if old_i == new_i:
-    #         return
-    #     if not (0 <= old_i < self.n_qubits and 0 <= new_i < self.n_qubits):
-    #         raise IndexError("Qubit index out of range")
-    #     new_state: Dict[StateKey, complex] = {}
-    #     for k, v in self.state.items():
-    #         lst = list(k)
-    #         bit = lst.pop(old_i)
-    #         lst.insert(new_i, bit)
-    #         new_state[tuple(lst)] = v
-    #     self.state = new_state
-
     @staticmethod
     def combine(qs1: 'QubitState', indices1: List[int], qs2: 'QubitState', indices2: List[int]) -> 'QubitState':
-        # interlace sorted indices
+        # Interlace sorted indices
         interlace = []
         while indices1 or indices2:
             if not indices1:
@@ -257,7 +239,6 @@ class QubitState:
 
         for key1, val1 in qs1.state.items():
             for key2, val2 in qs2.state.items():
-                # 1. buffer booleans della lunghezza finale
                 new_key = [False] * new_size
                 next_bit_new = 0
                 next_bit1 = 0

@@ -1,10 +1,6 @@
-
 from enum import Enum, auto
 
 class ActivationState(Enum):
-    """
-    
-    """
     ALWAYS = auto()
     NEVER = auto()
     SOMETIMES = auto()

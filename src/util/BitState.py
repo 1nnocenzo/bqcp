@@ -1,7 +1,3 @@
-"""
-This class is used to represent the state of classical bits in the propagation of the classical registers
-"""
-
 from enum import Enum, auto
 
 class BitState(Enum):

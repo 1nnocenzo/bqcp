@@ -1,5 +1,4 @@
 from typing import List, Tuple, Dict, Optional
-
 from util.QubitState import QubitState, QubitStateOrTop, EPS
 from util.ActivationState import *
 
@@ -226,11 +225,15 @@ class UnionTable:
         new_rest.remove_zero_entries()
 
         group = self.qubits_in_state(qs)
+        survivors = []
         for q in group:
             if q == qubit:
                 continue
             self.qu_reg[q] = QubitStateOrTop(new_rest)
+            survivors.append(q)
         self.qu_reg[qubit] = QubitStateOrTop(single)
+        for q in survivors:
+            self.separate(q)
         return True
 
     def separate(self, qubit: int) -> None:
@@ -261,7 +264,7 @@ class UnionTable:
             reduced = tuple(b for i, b in enumerate(key) if i != idx)
 
             # Only set if not present OR present as exact zero
-            if (reduced not in new_rest.state) or (new_rest.state[reduced] == 0):
+            if (reduced not in new_rest.state) or (abs(new_rest.state[reduced]) < EPS):
                 denom = alpha if (key[idx] is False) else beta
                 new_rest.state[reduced] = value / denom
 
