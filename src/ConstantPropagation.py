@@ -1,23 +1,17 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import List, Tuple, Sequence, Optional
 
 from qiskit import QuantumCircuit
 from qiskit.circuit import Instruction, ControlledGate, Gate, Qubit, Clbit
 from qiskit.quantum_info import Operator
-from qiskit.circuit.library import StatePreparation, XGate
 from qiskit.circuit.classical import expr
 from functools import reduce
-
-import numpy as np
 
 from util.UnionTable import UnionTable
 from util.ActivationState import ActivationState
 from util.BitState import BitState
 from util.QubitState import QubitStateOrTop, EPS
-from SimplifyCondition import SimplifyCondition
-import random
+from util.SimplifyCondition import SimplifyCondition
 
 __all__ = ["ConstantPropagation"]
 
@@ -231,7 +225,7 @@ class ConstantPropagation:
         lhs, val_exp = instr_cond
         val_exp = int(val_exp)
 
-        # Condition on a single classical bit, e.g. (Clbit, 0/1).
+        # Condition on a single classical bit
         if isinstance(lhs, Clbit):
             if val_exp not in (0, 1):
                 return False
@@ -241,7 +235,7 @@ class ConstantPropagation:
             expected = 1 if st == BitState.ONE else 0
             return expected == val_exp
 
-        # Register-like tuple condition: evaluate with local bit positions in cargs.
+        # Register-like tuple condition: evaluate with local bit positions in cargs
         mask = 0
         expected = 0
         all_known = True
@@ -547,7 +541,12 @@ class ConstantPropagation:
             if use_common:
                 out_instr, out_qargs = active_locals[0]
             else:
-                out_instr, out_qargs = instr, qargs
+                merged_for_output = cls._merge_tables([br.table for br in branches])
+                min_out = cls._minimize_controls(merged_for_output, instr, qargs)
+                if min_out is None:
+                    out_instr, out_qargs = instr, qargs
+                else:
+                    out_instr, out_qargs = min_out
 
             changed_any = False
             for br, min_local in zip(branches, local_min):
@@ -592,7 +591,6 @@ class ConstantPropagation:
 
         max_amplitudes = max_amplitudes or cls.MAX_AMPLITUDES
 
-        # Accept either a single table (legacy call) or a list of per-branch tables.
         if branch_tables is None:
             sim_tables: List[UnionTable] = []
         elif isinstance(branch_tables, list):
@@ -649,7 +647,7 @@ class ConstantPropagation:
                     continue
                 out_instr, out_qargs = min_out
 
-            # Branch-sensitive simulation to avoid losing cross-branch correlations.
+            # Branch-sensitive simulation to avoid losing cross-branch correlations
             changed_any = False
             for tab, min_local in zip(sim_tables, local_min):
                 if min_local is None:
@@ -773,7 +771,6 @@ class ConstantPropagation:
                 next_branches.append(new_br)
                 continue
 
-            # cond_eval is unknown
             if remaining_splits > 0:
                 remaining_splits -= 1
                 new_br_then = cls._clone_branch(br)
@@ -789,7 +786,6 @@ class ConstantPropagation:
                 next_branches.append(new_br_else)
                 continue
 
-            # No split budget left: conservatively join then/else effects for this branch.
             if not qc_then and not qc_else:
                 next_branches.append(cls._clone_branch(br))
                 continue
@@ -843,7 +839,7 @@ class ConstantPropagation:
         elif len(targets) == 2:
             cls._apply_two_qubit_gate(table, targets[0], targets[1], controls, instr)
         else:
-            # Multi‑qubit gates currently unsupported
+            # Gates with more than 2 targets currently unsupported
             for t in q_indices:
                 table.set_top(t)
 
