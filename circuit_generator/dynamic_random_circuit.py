@@ -10,7 +10,31 @@
 # copyright notice, and modified files need to carry a notice indicating
 # that they have been altered from the originals.
 
-"""Utility functions for generating random circuits."""
+"""Utility functions for generating random *dynamic* circuits.
+
+NOTE
+----
+This module is a modified version of Qiskit's ``qiskit.circuit.random.random_circuit``
+(``qiskit/circuit/random/utils.py``). It is **not** the unmodified Qiskit file: it has been
+extended to generate dynamic circuits that are suitable for exercising Branch-Aware Quantum
+Constant Propagation.
+
+The original generator emits mid-circuit measurements and conditionals in a fixed, hard-coded
+way. This version adds explicit control over the dynamic features of the generated circuit:
+
+* at most one conditional block per layer, inserted with probability ``prob_conditional_layer``,
+  instead of an independent draw per gate;
+* ``if_test`` blocks whose ``else`` branch is present with probability ``prob_else_branch``,
+  so that branch joins are exercised;
+* branch bodies of length sampled in ``[1, max_ops_per_branch]``;
+* an optional reset of the measured qubits, applied with probability
+  ``prob_reset_after_measure``;
+* branch bodies that may act on *any* qubit, including the ones just measured, so that the
+  value written to a classical bit can be propagated into the branch that reads it.
+
+Everything else (gate pools, layer construction, operand distribution) is unchanged from the
+Qiskit original, so the generator remains a drop-in replacement for it.
+"""
 import numpy as np
 from rustworkx import PyDiGraph
 
@@ -85,6 +109,10 @@ def random_circuit(
     reset=False,
     seed=None,
     num_operand_distribution: dict = None,
+    max_ops_per_branch: int = 10,
+    prob_conditional_layer: float = 0.2,
+    prob_reset_after_measure: float = 0.33333,
+    prob_else_branch: float = 0.5,
 ):
     """Generate random circuit of arbitrary size and form.
 
@@ -112,6 +140,16 @@ def random_circuit(
             of 1-qubit, 2-qubit, 3-qubit, ..., n-qubit gates in the random circuit. Expect a
             deviation from the specified ratios that depends on the size of the requested
             random circuit. (optional)
+        max_ops_per_branch (int): maximum number of operations generated in each
+            conditional branch; each branch length is sampled uniformly in
+            ``[1, max_ops_per_branch]``.
+        prob_conditional_layer (float): probability that a given layer receives a
+            conditional block.  This is the main control on how many mid-circuit
+            measurements, resets and ``if_else`` blocks the circuit contains.
+        prob_reset_after_measure (float): probability that the qubits measured by a
+            conditional block are also reset right afterwards.
+        prob_else_branch (float): probability that a generated ``if_test`` block also
+            carries an ``else`` branch, i.e. that it exercises a branch join.
 
     Returns:
         QuantumCircuit: constructed circuit
@@ -148,6 +186,9 @@ def random_circuit(
     # point precision errors
     if not np.isclose(sum(num_operand_distribution.values()), 1):
         raise CircuitError("The sum of all the values in 'num_operand_distribution' is not 1.")
+
+    if max_ops_per_branch < 1:
+        raise CircuitError("'max_ops_per_branch' must be at least 1.")
 
     if num_qubits == 0:
         return QuantumCircuit()
@@ -189,7 +230,7 @@ def random_circuit(
     active_operand_counts = [width for width, ratio in num_operand_distribution.items() if ratio > 0]
     min_active_operands = min(active_operand_counts)
 
-    def _sample_gate_spec_for_qubit_budget(qubit_budget):
+    def _sample_gate_spec_for_qubit_budget(qubit_budget, gate_lists):
         valid_widths = [
             width
             for width in active_operand_counts
@@ -200,8 +241,11 @@ def random_circuit(
         width_probs = np.array([num_operand_distribution[width] for width in valid_widths], dtype=float)
         width_probs /= width_probs.sum()
         chosen_width = int(rng.choice(valid_widths, p=width_probs))
-        gate_pool = all_gate_lists[chosen_width - 1]
+        gate_pool = gate_lists[chosen_width - 1]
         return gate_pool[rng.integers(0, len(gate_pool))]
+
+    branch_gates_1q = np.array(gates_1q_data, dtype=gates_1q.dtype)
+    branch_gate_lists = [branch_gates_1q, gates_2q, gates_3q, gates_4q]
 
     def _build_subset_condition(bits):
         if len(bits) == 1:
@@ -223,7 +267,10 @@ def random_circuit(
 
     def _append_random_conditional_ops(available_qubits, num_ops):
         for _ in range(num_ops):
-            cond_gate_spec = _sample_gate_spec_for_qubit_budget(len(available_qubits))
+            cond_gate_spec = _sample_gate_spec_for_qubit_budget(
+                len(available_qubits),
+                branch_gate_lists,
+            )
             if cond_gate_spec is None:
                 break
             cond_gate = cond_gate_spec["class"]
@@ -233,6 +280,20 @@ def random_circuit(
             cond_qargs = list(rng.choice(available_qubits, size=cond_num_qubits, replace=False))
             cond_operation = cond_gate(*cond_parameters)
             qc.append(CircuitInstruction(operation=cond_operation, qubits=cond_qargs))
+
+    def _append_random_if_test_block(bits, available_qubits):
+        condition = _build_subset_condition(bits)
+        num_then_ops = int(rng.integers(1, max_ops_per_branch + 1))
+        has_else_branch = bool(rng.random() < prob_else_branch)
+        if has_else_branch:
+            num_else_ops = int(rng.integers(1, max_ops_per_branch + 1))
+            with qc.if_test(condition) as else_:
+                _append_random_conditional_ops(available_qubits, num_then_ops)
+            with else_:
+                _append_random_conditional_ops(available_qubits, num_else_ops)
+        else:
+            with qc.if_test(condition):
+                _append_random_conditional_ops(available_qubits, num_then_ops)
 
     qc = QuantumCircuit(num_qubits)
 
@@ -311,25 +372,32 @@ def random_circuit(
         # conditional check is outside the two loops to make the more common case of no conditionals
         # faster, since in Python we don't have a compiler to do this for us.
         if conditional and layer_number != 0:
-            insert_conditional_block = rng.random(size=len(gate_specs)) < 0.1
-            for gate, q_start, q_end, p_start, p_end, add_conditional_block in zip(
-                gate_specs["class"],
-                q_indices[:-1],
-                q_indices[1:],
-                p_indices[:-1],
-                p_indices[1:],
-                insert_conditional_block,
+            # Conditional insertion is sampled per layer
+            add_conditional_layer = bool(rng.random() < prob_conditional_layer)
+            conditional_insert_at = (
+                int(rng.integers(0, len(gate_specs)))
+                if add_conditional_layer and len(gate_specs) > 0
+                else -1
+            )
+
+            for gate_idx, (gate, q_start, q_end, p_start, p_end) in enumerate(
+                zip(
+                    gate_specs["class"],
+                    q_indices[:-1],
+                    q_indices[1:],
+                    p_indices[:-1],
+                    p_indices[1:],
+                )
             ):
-                if add_conditional_block:
+                if gate_idx == conditional_insert_at:
                     # Reserve enough unmeasured qubits to always place at least one operation.
                     max_num_meas = num_qubits - min_active_operands
                     if max_num_meas >= 1:
                         num_meas = int(rng.integers(1, max_num_meas + 1))
                         measured_indices = np.sort(rng.choice(num_qubits, size=num_meas, replace=False))
-                        measured_set = {int(index) for index in measured_indices}
                         bits = [cr[int(index)] for index in measured_indices]
                         available_qubits = [
-                            qc.qubits[index] for index in range(num_qubits) if index not in measured_set
+                            qc.qubits[index] for index in range(num_qubits)
                         ]
 
                         # Measure only the selected qubits and map q[i] -> c[i].
@@ -337,22 +405,11 @@ def random_circuit(
                             idx = int(index)
                             qc.measure(qc.qubits[idx], cr[idx])
 
-                        if rng.random() < 0.5:
+                        if rng.random() < prob_reset_after_measure:
                             for index in measured_indices:
                                 qc.reset(qc.qubits[int(index)])
 
-                        condition = _build_subset_condition(bits)
-                        num_then_ops = int(rng.integers(5, 25))
-                        has_else_branch = bool(rng.random() < 0.5)
-                        if has_else_branch:
-                            num_else_ops = int(rng.integers(5, 25))
-                            with qc.if_test(condition) as else_:
-                                _append_random_conditional_ops(available_qubits, num_then_ops)
-                            with else_:
-                                _append_random_conditional_ops(available_qubits, num_else_ops)
-                        else:
-                            with qc.if_test(condition):
-                                _append_random_conditional_ops(available_qubits, num_then_ops)
+                        _append_random_if_test_block(bits, available_qubits)
 
                 operation = gate(*parameters[p_start:p_end])
                 qc._append(CircuitInstruction(operation=operation, qubits=qubits[q_start:q_end]))

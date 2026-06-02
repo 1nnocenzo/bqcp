@@ -4,7 +4,9 @@ This repository contains a Python implementation, built on top of **Qiskit**, of
 
 The main implementation is in `src/ConstantPropagation.py`. The method is described in the paper:
 
-- [Branch-Aware Quantum Constant Propagation for Dynamic Quantum Circuits](https://arxiv.org/abs/2606.02018), arXiv:2606.02018.
+- **Branch-Aware Quantum Constant Propagation for Dynamic Quantum Circuits**.
+  Presented at **QSW 2026** and published in the conference proceedings.
+  Preprint: [arXiv:2606.02018](https://arxiv.org/abs/2606.02018).
 
 ## What It Does
 
@@ -44,6 +46,7 @@ When the number of branches exceeds the limit, the analysis merges them conserva
 - `src/util/QubitState.py`: sparse representation of quantum states.
 - `src/util/BitState.py`: abstract state of classical bits.
 - `src/util/SimplifyCondition.py`: simplification of Qiskit classical conditions.
+- `circuit_generator/dynamic_random_circuit.py`: generator of random dynamic circuits, extended from Qiskit's `random_circuit`.
 - `run_optimization_pass.py`: script for applying the optimization to `.qpy` circuits.
 
 ## Requirements
@@ -82,6 +85,57 @@ python run_optimization_pass.py <input_folder> <output_folder>
 ```
 
 The script saves the optimized circuits and a JSON file with aggregate metrics. It also runs a sweep over different `max_branches` values, which is useful for comparing analysis precision and execution cost.
+
+## Generating Dynamic Test Circuits
+
+`circuit_generator/dynamic_random_circuit.py` generates the random dynamic circuits used to
+exercise and benchmark the optimization pass. It is an extended version of Qiskit's
+`qiskit.circuit.random.random_circuit`, and keeps the same signature, so it can be used as a
+drop-in replacement for it.
+
+The reason for extending it is that the Qiskit generator hard-codes how mid-circuit
+measurements and conditionals are emitted: a conditional block is drawn independently for every
+gate with a fixed 10% probability, and branch bodies always contain between 5 and 25
+operations. That gives little control over the very features BQCP is meant to analyse. This
+version exposes them as parameters:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `prob_conditional_layer` | `0.2` | Probability that a layer receives a conditional block. Main control over how many mid-circuit measurements and `if_else` blocks the circuit contains. |
+| `max_ops_per_branch` | `10` | Maximum number of operations per branch; each branch length is drawn uniformly from `[1, max_ops_per_branch]`. |
+| `prob_else_branch` | `0.5` | Probability that an `if_test` block also carries an `else` branch, i.e. that it exercises a branch join. |
+| `prob_reset_after_measure` | `0.33333` | Probability that the qubits measured by a conditional block are reset immediately afterwards. |
+
+Two further differences from the Qiskit original are worth noting, because they affect what the
+analysis sees:
+
+- at most **one** conditional block is inserted per layer, at a random position, instead of one
+  independent draw per gate. This keeps the number of branches predictable as depth grows;
+- branch bodies may act on **any** qubit, including the ones just measured, so that a value
+  written to a classical bit can be propagated into the branch that reads it.
+
+### Usage
+
+```python
+import sys
+sys.path.insert(0, "circuit_generator")
+
+from dynamic_random_circuit import random_circuit
+
+circuit = random_circuit(
+    num_qubits=8,
+    depth=20,
+    measure=True,
+    conditional=True,      # required: enables mid-circuit measurements and if_else blocks
+    seed=1234,
+    prob_conditional_layer=0.4,
+    max_ops_per_branch=15,
+)
+```
+
+`conditional=True` is what turns on the dynamic part of the circuit; with `conditional=False`
+the generator behaves like the static Qiskit one. Passing a `seed` makes generation
+reproducible, which matters when comparing optimization results across runs.
 
 ## Main Parameters
 
