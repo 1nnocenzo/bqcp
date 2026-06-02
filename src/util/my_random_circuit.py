@@ -156,12 +156,12 @@ def random_circuit(
         (standard_gates.CCXGate, 3, 0),
         (standard_gates.CSwapGate, 3, 0),
         (standard_gates.CCZGate, 3, 0),
-        # (standard_gates.RCCXGate, 3, 0),
+        (standard_gates.RCCXGate, 3, 0),
     ]
 
     gates_4q = [
         (standard_gates.C3SXGate, 4, 0),
-        # (standard_gates.RC3XGate, 4, 0),
+        (standard_gates.RC3XGate, 4, 0),
     ]
 
     gates_1q = np.array(
